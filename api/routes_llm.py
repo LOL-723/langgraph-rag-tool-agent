@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from llm.client import llm_client
-from schemas.llm import ChatRequest, ChatResponse, PersonInfoOutput
+from schemas.llm import ChatRequest, ChatResponse
 
 
 router = APIRouter(prefix="/llm", tags=["LLM"])
@@ -55,12 +55,11 @@ def stream_chat(req: ChatRequest):
         )
 
 
-@router.post("/json_chat", response_model=PersonInfoOutput)
+@router.post("/json_chat", response_model=dict)
 def json_chat(req: ChatRequest):
     try:
         result = llm_client.json_chat(
             user_message=req.message,
-            output_schema=PersonInfoOutput,
             system_prompt=req.system_prompt,
         )
         return result

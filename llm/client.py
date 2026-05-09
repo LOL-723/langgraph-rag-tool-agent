@@ -2,7 +2,6 @@ import json
 from typing import Any
 
 from openai import OpenAI
-from pydantic import BaseModel
 from core.config import settings
 
 
@@ -10,11 +9,13 @@ class LLMClient:
     JSON_OUTPUT_PROMPT = (
         "You must preserve and follow any previous system message from the user. "
         "The following rules only constrain the output format. "
-        "Return one valid JSON object only. "
+        "Return one valid JSON object only. Choose the JSON property names yourself "
+        "according to the user's request and the extracted information. "
         "Do not include markdown, comments, code fences, or extra text. "
-        "Every value must match the provided JSON schema exactly. "
-        "Do not use a string when the schema requires a number, and do not use a number "
-        "when the schema requires a string."
+        "Use conventional JSON value types: names, titles, emails, phone numbers, "
+        "addresses, descriptions, summaries, and dates should be strings; ages, counts, "
+        "scores, and quantities should be numbers; lists of skills, tags, or items should "
+        "be arrays. Never put a number in a name field."
     )
 
     def __init__(
@@ -81,7 +82,6 @@ class LLMClient:
     def json_chat(
         self,
         user_message: str,
-        output_schema: type[BaseModel],
         system_prompt: str | None = None,
     ) -> dict[str, Any]:
         if not user_message or not user_message.strip():
@@ -91,14 +91,10 @@ class LLMClient:
         if system_prompt and system_prompt.strip():
             messages.append({"role": "system", "content": system_prompt})
 
-        schema = output_schema.model_json_schema()
         messages.append(
             {
                 "role": "system",
-                "content": (
-                    f"{self.JSON_OUTPUT_PROMPT}\n"
-                    f"JSON schema: {json.dumps(schema, ensure_ascii=False)}"
-                ),
+                "content": self.JSON_OUTPUT_PROMPT,
             }
         )
         messages.append({"role": "user", "content": user_message})
@@ -110,7 +106,44 @@ class LLMClient:
         )
         content = response.choices[0].message.content or "{}"
         data = json.loads(content)
-        return output_schema.model_validate(data).model_dump()
+        if not isinstance(data, dict):
+            raise ValueError("LLM response must be a JSON object")
+
+        self._validate_json_semantics(data)
+        return data
+
+    def _validate_json_semantics(self, data: dict[str, Any]) -> None:
+        for key, value in data.items():
+            self._validate_json_value(key, value)
+
+    def _validate_json_value(self, key: str, value: Any) -> None:
+        key_lower = key.lower()
+
+        if isinstance(value, dict):
+            self._validate_json_semantics(value)
+            return
+
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    self._validate_json_semantics(item)
+            if self._key_contains(key_lower, ("skill", "tag", "item", "hobby")):
+                invalid_items = [item for item in value if not isinstance(item, str)]
+                if invalid_items:
+                    raise ValueError(f"{key} must contain strings only")
+            return
+
+        if self._key_contains(key_lower, ("name", "title", "email", "phone", "address", "date")):
+            if not isinstance(value, str):
+                raise ValueError(f"{key} must be a string")
+
+        if self._key_contains(key_lower, ("age", "count", "quantity", "score", "number")):
+            if not isinstance(value, int | float) or isinstance(value, bool):
+                raise ValueError(f"{key} must be a number")
+
+    @staticmethod
+    def _key_contains(key: str, words: tuple[str, ...]) -> bool:
+        return any(word in key for word in words)
 
 
 llm_client = LLMClient(

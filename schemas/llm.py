@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt, StrictStr
 
 
 class ChatRequest(BaseModel):
@@ -11,13 +11,15 @@ class ChatResponse(BaseModel):
 
 
 class SummaryOutput(BaseModel):
-    title: str = Field(..., description="Summary title")
-    summary: str = Field(..., description="Summary text")
-    key_points: list[str] = Field(default_factory=list, description="Key points")
-    action_items: list[str] = Field(default_factory=list, description="Action items")
+    title: StrictStr = Field(..., description="Summary title")
+    summary: StrictStr = Field(..., description="Summary text")
+    key_points: list[StrictStr] = Field(default_factory=list, description="Key points")
+    action_items: list[StrictStr] = Field(default_factory=list, description="Action items")
 
 
 class PersonInfoOutput(BaseModel):
-    name: str = Field(..., description="Person name")
-    age: int = Field(..., description="Person age")
-    skills: list[str] = Field(default_factory=list, description="Skills")
+    name: StrictStr = Field(..., description="Person name")
+    age: StrictInt = Field(..., description="Person age")
+    skills: list[StrictStr] = Field(default_factory=list, description="Skills")
+
+

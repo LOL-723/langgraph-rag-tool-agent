@@ -1,12 +1,22 @@
 import json
+from typing import Any
 
 from openai import OpenAI
 from pydantic import BaseModel
-
 from core.config import settings
 
 
 class LLMClient:
+    JSON_OUTPUT_PROMPT = (
+        "You must preserve and follow any previous system message from the user. "
+        "The following rules only constrain the output format. "
+        "Return one valid JSON object only. "
+        "Do not include markdown, comments, code fences, or extra text. "
+        "Every value must match the provided JSON schema exactly. "
+        "Do not use a string when the schema requires a number, and do not use a number "
+        "when the schema requires a string."
+    )
+
     def __init__(
         self,
         api_key: str,
@@ -68,37 +78,30 @@ class LLMClient:
             if content:
                 yield content
 
-    def structured_chat(
+    def json_chat(
         self,
         user_message: str,
         output_schema: type[BaseModel],
         system_prompt: str | None = None,
-    ) -> BaseModel:
+    ) -> dict[str, Any]:
         if not user_message or not user_message.strip():
             raise ValueError("message cannot be empty")
 
-        schema = output_schema.model_json_schema()
-        schema_prompt = (
-            "Extract information from the user message and return JSON only. "
-            "Do not include markdown, comments, or extra text. "
-            f"The JSON must match this schema: {json.dumps(schema, ensure_ascii=False)}"
-        )
-        final_system_prompt = (
-            f"{system_prompt}\n\n{schema_prompt}"
-            if system_prompt
-            else schema_prompt
-        )
+        messages: list[dict[str, str]] = []
+        if system_prompt and system_prompt.strip():
+            messages.append({"role": "system", "content": system_prompt})
 
-        messages = [
+        schema = output_schema.model_json_schema()
+        messages.append(
             {
                 "role": "system",
-                "content": final_system_prompt,
-            },
-            {
-                "role": "user",
-                "content": user_message,
-            },
-        ]
+                "content": (
+                    f"{self.JSON_OUTPUT_PROMPT}\n"
+                    f"JSON schema: {json.dumps(schema, ensure_ascii=False)}"
+                ),
+            }
+        )
+        messages.append({"role": "user", "content": user_message})
 
         response = self.client.chat.completions.create(
             model=self.model,
@@ -107,7 +110,7 @@ class LLMClient:
         )
         content = response.choices[0].message.content or "{}"
         data = json.loads(content)
-        return output_schema.model_validate(data)
+        return output_schema.model_validate(data).model_dump()
 
 
 llm_client = LLMClient(

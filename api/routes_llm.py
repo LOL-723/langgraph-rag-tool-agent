@@ -55,21 +55,13 @@ def stream_chat(req: ChatRequest):
         )
 
 
-@router.post("/extract_person", response_model=PersonInfoOutput)
-def extract_person(req: ChatRequest):
+@router.post("/json_chat", response_model=PersonInfoOutput)
+def json_chat(req: ChatRequest):
     try:
-        result = llm_client.structured_chat(
+        result = llm_client.json_chat(
             user_message=req.message,
             output_schema=PersonInfoOutput,
-            system_prompt=req.system_prompt or (
-                "You are an information extraction assistant. "
-                "Extract person information from the target sentence in the user message. "
-                "If the user message contains a Chinese or English colon, the target sentence is after the colon. "
-                "For example, from '小红今年 18 岁，会 Java' return "
-                '{"name":"小红","age":18,"skills":["Java"]}. '
-                "The name is usually the text before '今年'. "
-                "Return JSON only."
-            ),
+            system_prompt=req.system_prompt,
         )
         return result
 
@@ -79,5 +71,5 @@ def extract_person(req: ChatRequest):
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"LLM structured request failed: {str(e)}"
+            detail=f"LLM JSON request failed: {str(e)}"
         )

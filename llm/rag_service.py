@@ -3,13 +3,13 @@ import json
 import logging
 import math
 import re
+import sys
 import threading
 from pathlib import Path
 
 from fastapi import UploadFile
 
 from core.config import settings
-from llm.client import llm_client
 from schemas.rag import RagAskResponse, RagChunk, RagSource, RagUploadResponse
 
 
@@ -61,25 +61,11 @@ class RagService:
         if not chunk_texts:
             raise RagError("no chunks could be created from this file")
 
-        embeddings = self.embed_chunks(chunk_texts)
         chunk_ids = [f"{document_id}-{index:04d}" for index in range(len(chunk_texts))]
         metadatas = [
             {"document_id": document_id, "filename": filename, "chunk_index": index}
             for index in range(len(chunk_texts))
         ]
-
-        try:
-            self.collection.delete(where={"document_id": document_id})
-        except Exception:
-            pass
-
-        self.collection.upsert(
-            ids=chunk_ids,
-            embeddings=embeddings,
-            metadatas=metadatas,
-            documents=chunk_texts,
-        )
-
         chunks = [
             RagChunk(id=chunk_ids[index], index=index, content=chunk)
             for index, chunk in enumerate(chunk_texts)
@@ -88,6 +74,21 @@ class RagService:
             json.dumps([chunk.model_dump() for chunk in chunks], ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+        collection = self._collection_or_none()
+        if collection is not None:
+            embeddings = self.embed_chunks(chunk_texts)
+            try:
+                collection.delete(where={"document_id": document_id})
+            except Exception:
+                pass
+
+            collection.upsert(
+                ids=chunk_ids,
+                embeddings=embeddings,
+                metadatas=metadatas,
+                documents=chunk_texts,
+            )
 
         return RagUploadResponse(
             document_id=document_id,
@@ -100,17 +101,27 @@ class RagService:
         if not question or not question.strip():
             raise RagError("question cannot be empty")
 
-        retrieved = self.retrieve(question, top_k or settings.RAG_RETRIEVE_TOP_K)
+        retrieved, retrieval_mode = self.retrieve_with_mode(question, top_k or settings.RAG_RETRIEVE_TOP_K)
         if not retrieved:
-            return RagAskResponse(answer="根据已上传文档无法回答。", sources=[])
+            return RagAskResponse(
+                answer="根据已上传文档无法回答。",
+                sources=[],
+                retrieval_mode=retrieval_mode,
+            )
 
         reranked = self.rerank(question, retrieved, rerank_top_k or settings.RAG_RERANK_TOP_K)
         answer = self.generate(question, [source.content for source in reranked])
-        return RagAskResponse(answer=answer, sources=reranked)
+        return RagAskResponse(answer=answer, sources=reranked, retrieval_mode=retrieval_mode)
 
-    def retrieve(self, query: str, top_k: int) -> list[RagSource]:
+    def retrieve_with_mode(self, query: str, top_k: int) -> tuple[list[RagSource], str]:
         query_embedding = self.embed_text(query)
-        results = self.collection.query(query_embeddings=[query_embedding], n_results=top_k)
+        collection = self._collection_or_none()
+        if collection is None:
+            # Fallback retrieval: when Chroma is unavailable in the running
+            # environment, search saved chunks.json files directly.
+            return self._retrieve_from_local_chunks(query_embedding, top_k), "local"
+
+        results = collection.query(query_embeddings=[query_embedding], n_results=top_k)
         documents = (results.get("documents") or [[]])[0]
         metadatas = (results.get("metadatas") or [[]])[0]
         ids = (results.get("ids") or [[]])[0]
@@ -127,6 +138,10 @@ class RagService:
                     content=content,
                 )
             )
+        return sources, "chroma"
+
+    def retrieve(self, query: str, top_k: int) -> list[RagSource]:
+        sources, _ = self.retrieve_with_mode(query, top_k)
         return sources
 
     def rerank(self, query: str, sources: list[RagSource], top_k: int) -> list[RagSource]:
@@ -140,6 +155,8 @@ class RagService:
         return [source for source, _ in ranked[:top_k]]
 
     def generate(self, question: str, chunks: list[str]) -> str:
+        from llm.client import llm_client
+
         context = "\n\n".join(f"[{index}] {chunk}" for index, chunk in enumerate(chunks))
         system_prompt = (
             "你是一个知识库问答助手。只能根据提供的文档片段回答。"
@@ -237,12 +254,63 @@ class RagService:
         if self._collection is None:
             with self._lock:
                 if self._collection is None:
-                    import chromadb
+                    try:
+                        import chromadb
+                    except ModuleNotFoundError as exc:
+                        raise RagError(
+                            "chromadb is not installed in the FastAPI runtime. "
+                            f"python executable: {sys.executable}. "
+                            "Install dependencies with: python -m pip install -r requirements.txt"
+                        ) from exc
 
                     Path(settings.RAG_CHROMA_DIR).mkdir(parents=True, exist_ok=True)
                     client = chromadb.PersistentClient(path=settings.RAG_CHROMA_DIR)
                     self._collection = client.get_or_create_collection(name=settings.RAG_COLLECTION_NAME)
         return self._collection
+
+    def _collection_or_none(self):
+        try:
+            return self.collection
+        except RagError as exc:
+            logging.warning("Chroma unavailable; using local chunk retrieval: %s", exc)
+            return None
+
+    def _retrieve_from_local_chunks(self, query_embedding: list[float], top_k: int) -> list[RagSource]:
+        # Local fallback retrieval path. This intentionally avoids importing or
+        # calling Chroma so RAG can still work when chromadb is missing.
+        scored_sources: list[tuple[float, RagSource]] = []
+
+        for chunks_file in self.storage_dir.glob("*/chunks.json"):
+            document_id = chunks_file.parent.name
+            try:
+                chunks_data = json.loads(chunks_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+
+            source_file = next(
+                (path for path in chunks_file.parent.iterdir() if path.name != "chunks.json"),
+                None,
+            )
+            filename = source_file.name if source_file else document_id
+
+            for chunk_data in chunks_data:
+                content = str(chunk_data.get("content", ""))
+                if not content:
+                    continue
+
+                chunk_embedding = self.embed_text(content)
+                score = self._cosine_similarity(query_embedding, chunk_embedding)
+                source = RagSource(
+                    chunk_id=str(chunk_data.get("id", "")),
+                    document_id=document_id,
+                    filename=filename,
+                    chunk_index=int(chunk_data.get("index", 0)),
+                    content=content,
+                )
+                scored_sources.append((score, source))
+
+        scored_sources.sort(key=lambda item: item[0], reverse=True)
+        return [source for _, source in scored_sources[:top_k]]
 
     def _find_chunk_end(self, text: str, start: int, hard_end: int) -> int:
         if hard_end >= len(text):
@@ -310,6 +378,10 @@ class RagService:
                 vector[index] += sign
         norm = math.sqrt(sum(value * value for value in vector)) or 1.0
         return [value / norm for value in vector]
+
+    @staticmethod
+    def _cosine_similarity(left: list[float], right: list[float]) -> float:
+        return sum(left_value * right_value for left_value, right_value in zip(left, right))
 
 
 rag_service = RagService()

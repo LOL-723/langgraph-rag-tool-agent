@@ -2,33 +2,12 @@ import json
 from typing import Any
 
 from openai import OpenAI
+
 from core.config import settings
-from llm.tools import TOOL_ARGUMENTS, TOOL_DESCRIPTIONS, TOOL_REGISTRY
+from llm import langgraph_def
 
 
 class LLMClient:
-    JSON_OUTPUT_PROMPT = (
-        "You must preserve and follow any previous system message from the user. "
-        "The following rules only constrain the output format. "
-        "Return one valid JSON object only. Choose the JSON property names yourself "
-        "according to the user's request and the extracted information. "
-        "Do not include markdown, comments, code fences, or extra text. "
-        "Use conventional JSON value types: names, titles, emails, phone numbers, "
-        "addresses, descriptions, summaries, and dates should be strings; ages, counts, "
-        "scores, and quantities should be numbers; lists of skills, tags, or items should "
-        "be arrays. Never put a number in a name field."
-    )
-    TOOL_ROUTER_PROMPT = (
-        "You are a tool router. Decide whether the user's message needs one of the "
-        "available tools. Match by semantic meaning, not exact wording. For example, "
-        "'现在几点？' means the same thing as '获取当前时间' and should call "
-        "get_current_time. If the user asks for time in another country, city, or "
-        "region, pass that place in arguments.location. Return one valid JSON object "
-        "only with this shape: "
-        '{"tool_calls":[{"name":"tool_name","arguments":{"location":"place"}}]}. '
-        "If no tool is needed, return {\"tool_calls\":[]}."
-    )
-
     def __init__(
         self,
         api_key: str,
@@ -37,6 +16,7 @@ class LLMClient:
         timeout: float = 30.0,
     ):
         self.model = model
+        self.langgraph = langgraph_def.build_graph()
 
         self.client = OpenAI(
             api_key=api_key,
@@ -94,113 +74,77 @@ class LLMClient:
         self,
         user_message: str,
         system_prompt: str | None = None,
+        file: Any | None = None,
     ) -> dict[str, Any]:
         if not user_message or not user_message.strip():
             raise ValueError("message cannot be empty")
 
-        messages: list[dict[str, str]] = []
-        if system_prompt and system_prompt.strip():
-            messages.append({"role": "system", "content": system_prompt})
-
-        tool_results = self._run_tools_for_json_chat(user_message)
-        if tool_results:
-            messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "Tool results are authoritative. Use them to answer the "
-                        "user's request in the final JSON object: "
-                        f"{json.dumps(tool_results, ensure_ascii=False)}"
-                    ),
-                }
-            )
-
-        messages.append(
-            {
-                "role": "system",
-                "content": self.JSON_OUTPUT_PROMPT,
-            }
+        file_info = self._upload_optional_file(file)
+        graph_result = self.run_langgraph(
+            user_message=user_message,
+            system_prompt=system_prompt,
+            file_info=file_info,
         )
-        messages.append({"role": "user", "content": user_message})
+        return self._format_graph_json_result(graph_result)
 
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            response_format={"type": "json_object"},
-        )
-        content = response.choices[0].message.content or "{}"
-        data = json.loads(content)
-        if not isinstance(data, dict):
-            raise ValueError("LLM response must be a JSON object")
+    def run_langgraph(
+        self,
+        user_message: str,
+        system_prompt: str | None = None,
+        file_info: dict[str, Any] | None = None,
+    ) -> langgraph_def.AgentState:
+        initial_state: langgraph_def.AgentState = {
+            "question": user_message,
+            "system_prompt": system_prompt,
+            "retry_count": 0,
+            "logs": [],
+        }
+        if file_info:
+            initial_state["file_info"] = file_info
 
-        self._validate_json_semantics(data)
-        return data
+        return self.langgraph.invoke(initial_state)
 
-    def _run_tools_for_json_chat(self, user_message: str) -> list[dict[str, Any]]:
-        tool_calls = self._select_tools_for_json_chat(user_message)
-        results: list[dict[str, Any]] = []
+    def _format_graph_json_result(
+        self,
+        graph_result: langgraph_def.AgentState,
+    ) -> dict[str, Any]:
+        route = graph_result.get("route", "chat")
+        answer = graph_result.get("answer", "")
+        use_local_retrieval = route == "rag" and graph_result.get("rag_retrieval_mode") == "local"
 
-        for tool_call in tool_calls:
-            name = tool_call.get("name")
-            arguments = tool_call.get("arguments") or {}
-            if not isinstance(name, str) or name not in TOOL_REGISTRY:
-                continue
-            if not isinstance(arguments, dict):
-                arguments = {}
-
-            result = TOOL_REGISTRY[name](**arguments)
-            results.append(
-                {
-                    "name": name,
-                    "description": TOOL_DESCRIPTIONS.get(name, ""),
-                    "result": result,
-                }
-            )
-
-        return results
-
-    def _select_tools_for_json_chat(self, user_message: str) -> list[dict[str, Any]]:
-        available_tools = [
-            {
-                "name": name,
-                "description": description,
-                "arguments": TOOL_ARGUMENTS.get(name, {}),
-            }
-            for name, description in TOOL_DESCRIPTIONS.items()
-        ]
-        if not available_tools:
-            return []
-
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": self.TOOL_ROUTER_PROMPT},
-                {
-                    "role": "system",
-                    "content": (
-                        "Available tools: "
-                        f"{json.dumps(available_tools, ensure_ascii=False)}"
-                    ),
-                },
-                {"role": "user", "content": user_message},
-            ],
-            response_format={"type": "json_object"},
-        )
-
-        content = response.choices[0].message.content or '{"tool_calls":[]}'
         try:
-            data = json.loads(content)
+            parsed_answer = json.loads(answer)
         except json.JSONDecodeError:
-            return []
+            message = f"{answer}(本地检索)" if use_local_retrieval and answer else answer
+            return {
+                "route": route,
+                "message": message,
+            }
 
-        if not isinstance(data, dict):
-            return []
+        if isinstance(parsed_answer, dict):
+            if use_local_retrieval:
+                message = str(parsed_answer.get("message", ""))
+                parsed_answer["message"] = f"{message}(本地检索)"
+            parsed_answer["route"] = route
+            return parsed_answer
 
-        tool_calls = data.get("tool_calls", [])
-        if not isinstance(tool_calls, list):
-            return []
+        result = {
+            "route": route,
+            "data": parsed_answer,
+        }
+        if use_local_retrieval:
+            result["message"] = "(本地检索)"
+        return result
 
-        return [tool_call for tool_call in tool_calls if isinstance(tool_call, dict)]
+    def _upload_optional_file(self, file: Any | None) -> dict[str, Any] | None:
+        if file is None:
+            return None
+
+        import anyio
+        from llm.rag_service import rag_service
+
+        upload_result = anyio.run(rag_service.upload, file)
+        return upload_result.model_dump()
 
     def _validate_json_semantics(self, data: dict[str, Any]) -> None:
         for key, value in data.items():
@@ -240,5 +184,5 @@ llm_client = LLMClient(
     api_key=settings.DEEPSEEK_API_KEY,
     base_url=settings.DEEPSEEK_BASE_URL,
     model=settings.LLM_MODEL,
-    timeout=settings.LLM_TIMEOUT
+    timeout=settings.LLM_TIMEOUT,
 )

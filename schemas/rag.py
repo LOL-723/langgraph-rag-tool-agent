@@ -31,3 +31,4 @@ class RagSource(BaseModel):
 class RagAskResponse(BaseModel):
     answer: str
     sources: list[RagSource]
+    retrieval_mode: str = "chroma"

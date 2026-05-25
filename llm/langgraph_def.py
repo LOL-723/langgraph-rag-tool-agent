@@ -18,6 +18,7 @@ class AgentState(TypedDict, total=False):
     system_prompt: str | None
     answer: str
     route: RouteName
+    use_rag: bool
     file_info: dict[str, Any]
     tool_calls: list[dict[str, Any]]
     tool_results: list[dict[str, Any]]
@@ -70,7 +71,7 @@ def add_log(
 def router_node(state: AgentState) -> AgentState:
     question = state["question"]
 
-    if state.get("file_info") and _has_rag_intent(question):
+    if state.get("file_info") and state.get("use_rag", False):
         route: RouteName = "rag"
         tool_calls: list[dict[str, Any]] = []
     else:
@@ -319,6 +320,7 @@ def _rerun_from_router(state: AgentState, retry_count: int) -> AgentState:
     retry_state: AgentState = {
         "question": state["question"],
         "system_prompt": state.get("system_prompt"),
+        "use_rag": state.get("use_rag", False),
         "retry_count": retry_count,
         "logs": add_log(
             state=state,
@@ -344,26 +346,6 @@ def _merge_state(state: AgentState, update: AgentState) -> AgentState:
     merged = dict(state)
     merged.update(update)
     return merged
-
-
-def _has_rag_intent(question: str) -> bool:
-    if any(
-        keyword in question
-        for keyword in (
-            "根据文档",
-            "基于文档",
-            "参考文档",
-            "文档中",
-            "资料中",
-            "上传的文件",
-            "上传文件",
-            "RAG",
-            "rag",
-        )
-    ):
-        return True
-    rag_keywords = ("根据文档", "基于文档", "参考文档", "文档中", "资料中", "RAG", "rag")
-    return any(keyword in question for keyword in rag_keywords)
 
 
 def _select_tool_calls(user_message: str) -> list[dict[str, Any]]:

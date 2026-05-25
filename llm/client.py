@@ -75,15 +75,17 @@ class LLMClient:
         user_message: str,
         system_prompt: str | None = None,
         file: Any | None = None,
+        use_rag: bool = False,
     ) -> dict[str, Any]:
         if not user_message or not user_message.strip():
             raise ValueError("message cannot be empty")
 
-        file_info = self._upload_optional_file(file)
+        file_info = self._upload_optional_file(file) if use_rag else None
         graph_result = self.run_langgraph(
             user_message=user_message,
             system_prompt=system_prompt,
             file_info=file_info,
+            use_rag=use_rag,
         )
         return self._format_graph_json_result(graph_result)
 
@@ -92,10 +94,12 @@ class LLMClient:
         user_message: str,
         system_prompt: str | None = None,
         file_info: dict[str, Any] | None = None,
+        use_rag: bool = False,
     ) -> langgraph_def.AgentState:
         initial_state: langgraph_def.AgentState = {
             "question": user_message,
             "system_prompt": system_prompt,
+            "use_rag": use_rag,
             "retry_count": 0,
             "logs": [],
         }

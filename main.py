@@ -1,3 +1,7 @@
+from core.runtime import ensure_project_runtime
+
+ensure_project_runtime()
+
 from fastapi import FastAPI
 
 from api.routes_llm import router as llm_router

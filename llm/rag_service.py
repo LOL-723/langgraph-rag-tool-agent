@@ -10,6 +10,7 @@ from pathlib import Path
 from fastapi import UploadFile
 
 from core.config import settings
+from core.runtime import EXPECTED_PYTHON
 from schemas.rag import RagAskResponse, RagChunk, RagSource, RagUploadResponse
 
 
@@ -260,7 +261,9 @@ class RagService:
                         raise RagError(
                             "chromadb is not installed in the FastAPI runtime. "
                             f"python executable: {sys.executable}. "
-                            "Install dependencies with: python -m pip install -r requirements.txt"
+                            f"expected executable: {EXPECTED_PYTHON}. "
+                            "Start with scripts/dev.ps1 or install dependencies with: "
+                            "python -m pip install -r requirements.txt"
                         ) from exc
 
                     Path(settings.RAG_CHROMA_DIR).mkdir(parents=True, exist_ok=True)

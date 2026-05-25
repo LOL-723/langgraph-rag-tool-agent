@@ -59,6 +59,7 @@ def stream_chat(req: ChatRequest):
 def json_chat(
     message: str = Form(...),
     system_prompt: str | None = Form(default=None),
+    use_rag: bool = Form(default=False),
     file: UploadFile | None = File(default=None),
 ):
     try:
@@ -66,6 +67,7 @@ def json_chat(
             user_message=message,
             system_prompt=system_prompt,
             file=file,
+            use_rag=use_rag,
         )
         return result
 

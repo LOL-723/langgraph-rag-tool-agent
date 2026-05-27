@@ -51,6 +51,9 @@ class RagService:
         document_id = hashlib.sha256(content).hexdigest()[:16]
         doc_dir = self.storage_dir / document_id
         doc_dir.mkdir(parents=True, exist_ok=True)
+        for stale_file in doc_dir.iterdir():
+            if stale_file.is_file() and stale_file.name != "chunks.json":
+                stale_file.unlink()
         file_path = doc_dir / self._safe_filename(filename)
         file_path.write_bytes(content)
 
@@ -98,11 +101,27 @@ class RagService:
             chunks=chunks,
         )
 
-    def ask(self, question: str, top_k: int | None = None, rerank_top_k: int | None = None) -> RagAskResponse:
+    def ask(
+        self,
+        question: str,
+        top_k: int | None = None,
+        rerank_top_k: int | None = None,
+        document_id: str | None = None,
+    ) -> RagAskResponse:
         if not question or not question.strip():
             raise RagError("question cannot be empty")
+        if document_id is not None:
+            document_id = document_id.strip()
+            if not document_id:
+                raise RagError("document_id cannot be empty")
+            if not (self.storage_dir / document_id / "chunks.json").exists():
+                raise RagError(f"document not found: {document_id}")
 
-        retrieved, retrieval_mode = self.retrieve_with_mode(question, top_k or settings.RAG_RETRIEVE_TOP_K)
+        retrieved, retrieval_mode = self.retrieve_with_mode(
+            question,
+            top_k or settings.RAG_RETRIEVE_TOP_K,
+            document_id=document_id,
+        )
         if not retrieved:
             return RagAskResponse(
                 answer="根据已上传文档无法回答。",
@@ -115,16 +134,31 @@ class RagService:
         return RagAskResponse(answer=answer, sources=reranked, retrieval_mode=retrieval_mode)
 
     #rag_node召回入口，返回值为从向量数据库中召回的片段
-    def retrieve_with_mode(self, query: str, top_k: int) -> tuple[list[RagSource], str]:
+    def retrieve_with_mode(
+        self,
+        query: str,
+        top_k: int,
+        document_id: str | None = None,
+    ) -> tuple[list[RagSource], str]:
         query_embedding = self.embed_text(query)#选择使用的RAG方式(本地/Chroma)，并将问题转换为向量
         collection = self._collection_or_none()
         if collection is None:
             # Fallback retrieval: when Chroma is unavailable in the running
             # environment, search saved chunks.json files directly.
-            return self._retrieve_from_local_chunks(query_embedding, top_k), "local"
+            return self._retrieve_from_local_chunks(
+                query_embedding,
+                top_k,
+                document_id=document_id,
+            ), "local"
 
         #query_embedding自身就是问题的向量，但由于chroma支持一次性多问题，返回的需要是一个向量列表，因此用query_embeddings，从[X]变成[ [X] ]
-        results = collection.query(query_embeddings=[query_embedding], n_results=top_k)
+        query_kwargs: dict[str, object] = {
+            "query_embeddings": [query_embedding],
+            "n_results": top_k,
+        }
+        if document_id:
+            query_kwargs["where"] = {"document_id": document_id}
+        results = collection.query(**query_kwargs)
         #由于问题有可能为多个，所以documents，metadatas，ids也都是列表，但"问题向量"只有一个，所以拿[0]
         #results.get("documents") or [[]]代表能拿到"documents"就拿。拿不到就用[[]]这个空列表代替，避免执行报错
         documents = (results.get("documents") or [[]])[0]
@@ -146,8 +180,8 @@ class RagService:
             )
         return sources, "chroma"
 
-    def retrieve(self, query: str, top_k: int) -> list[RagSource]:
-        sources, _ = self.retrieve_with_mode(query, top_k)
+    def retrieve(self, query: str, top_k: int, document_id: str | None = None) -> list[RagSource]:
+        sources, _ = self.retrieve_with_mode(query, top_k, document_id=document_id)
         return sources
 
     #rag_node重排入口，返回重排后的相关性最高的top_k个片段
@@ -292,13 +326,20 @@ class RagService:
             logging.warning("Chroma unavailable; using local chunk retrieval: %s", exc)
             return None
 
-    def _retrieve_from_local_chunks(self, query_embedding: list[float], top_k: int) -> list[RagSource]:
+    def _retrieve_from_local_chunks(
+        self,
+        query_embedding: list[float],
+        top_k: int,
+        document_id: str | None = None,
+    ) -> list[RagSource]:
         # Local fallback retrieval path. This intentionally avoids importing or
         # calling Chroma so RAG can still work when chromadb is missing.
         scored_sources: list[tuple[float, RagSource]] = []
 
         for chunks_file in self.storage_dir.glob("*/chunks.json"):
-            document_id = chunks_file.parent.name
+            current_document_id = chunks_file.parent.name
+            if document_id and current_document_id != document_id:
+                continue
             try:
                 chunks_data = json.loads(chunks_file.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
@@ -308,7 +349,7 @@ class RagService:
                 (path for path in chunks_file.parent.iterdir() if path.name != "chunks.json"),
                 None,
             )
-            filename = source_file.name if source_file else document_id
+            filename = source_file.name if source_file else current_document_id
 
             for chunk_data in chunks_data:
                 content = str(chunk_data.get("content", ""))
@@ -319,7 +360,7 @@ class RagService:
                 score = self._cosine_similarity(query_embedding, chunk_embedding)
                 source = RagSource(
                     chunk_id=str(chunk_data.get("id", "")),
-                    document_id=document_id,
+                    document_id=current_document_id,
                     filename=filename,
                     chunk_index=int(chunk_data.get("index", 0)),
                     content=content,

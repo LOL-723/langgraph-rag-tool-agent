@@ -131,9 +131,12 @@ def route_decision(
 
 def rag_node(state: AgentState) -> AgentState:
     question = state["question"]
+    file_info = state.get("file_info") or {}
+    document_id = str(file_info.get("document_id", "")).strip() or None
     retrieved, retrieval_mode = rag_service.retrieve_with_mode(
         question,
         settings.RAG_RETRIEVE_TOP_K,
+        document_id=document_id,
     )
     reranked = rag_service.rerank(
         question,
@@ -150,7 +153,12 @@ def rag_node(state: AgentState) -> AgentState:
             state=state,
             node="rag_node",
             message="retrieved and reranked uploaded documents",
-            extra={"source_count": len(sources), "retrieval_mode": retrieval_mode},
+            extra={
+                "source_count": len(sources),
+                "retrieval_mode": retrieval_mode,
+                "document_id": document_id,
+                "filename": file_info.get("filename"),
+            },
         ),
     }
 

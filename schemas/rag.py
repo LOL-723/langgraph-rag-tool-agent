@@ -16,6 +16,7 @@ class RagUploadResponse(BaseModel):
 
 class RagAskRequest(BaseModel):
     question: str = Field(..., description="Question to answer from uploaded documents")
+    document_id: str = Field(..., description="Uploaded document id to retrieve from")
     top_k: int | None = Field(default=None, ge=1, le=20)
     rerank_top_k: int | None = Field(default=None, ge=1, le=10)
 

@@ -79,6 +79,8 @@ class LLMClient:
     ) -> dict[str, Any]:
         if not user_message or not user_message.strip():
             raise ValueError("message cannot be empty")
+        if use_rag and file is None:
+            raise ValueError("RAG requires an uploaded file")
 
         file_info = self._upload_optional_file(file) if use_rag else None
         graph_result = self.run_langgraph(
@@ -122,23 +124,27 @@ class LLMClient:
         answer = graph_result.get("answer", "")
         end_status = graph_result.get("end_status")
         use_local_retrieval = route == "rag" and graph_result.get("rag_retrieval_mode") == "local"
+        rag_metadata = self._rag_response_metadata(graph_result)
 
         try:
             parsed_answer = json.loads(answer)
         except json.JSONDecodeError:
-            message = f"{answer}(本地检索)" if use_local_retrieval and answer else answer
-            return {
+            message = f"{answer}(local retrieval)" if use_local_retrieval and answer else answer
+            result = {
                 "route": route,
                 "end_status": end_status,
                 "message": message,
             }
+            result.update(rag_metadata)
+            return result
 
         if isinstance(parsed_answer, dict):
             if use_local_retrieval:
                 message = str(parsed_answer.get("message", ""))
-                parsed_answer["message"] = f"{message}(本地检索)"
+                parsed_answer["message"] = f"{message}(local retrieval)"
             parsed_answer["route"] = route
             parsed_answer["end_status"] = end_status
+            parsed_answer.update(rag_metadata)
             return parsed_answer
 
         result = {
@@ -147,8 +153,25 @@ class LLMClient:
             "data": parsed_answer,
         }
         if use_local_retrieval:
-            result["message"] = "(本地检索)"
+            result["message"] = "(local retrieval)"
+        result.update(rag_metadata)
         return result
+
+    @staticmethod
+    def _rag_response_metadata(graph_result: langgraph_def.AgentState) -> dict[str, Any]:
+        if graph_result.get("route") != "rag":
+            return {}
+
+        file_info = graph_result.get("file_info") or {}
+        return {
+            "rag_document": {
+                "document_id": file_info.get("document_id"),
+                "filename": file_info.get("filename"),
+                "chunk_count": file_info.get("chunk_count"),
+            },
+            "rag_sources": graph_result.get("retrieved_docs", []),
+            "rag_retrieval_mode": graph_result.get("rag_retrieval_mode"),
+        }
 
     def _upload_optional_file(self, file: Any | None) -> dict[str, Any] | None:
         if file is None:

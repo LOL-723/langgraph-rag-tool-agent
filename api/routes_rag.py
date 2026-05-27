@@ -24,6 +24,7 @@ def ask_document(req: RagAskRequest):
             question=req.question,
             top_k=req.top_k,
             rerank_top_k=req.rerank_top_k,
+            document_id=req.document_id,
         )
     except RagError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

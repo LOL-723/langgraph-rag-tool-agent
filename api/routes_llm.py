@@ -1,8 +1,8 @@
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
-from llm.client import llm_client
 from schemas.llm import ChatRequest, ChatResponse
+from llm.client import llm_client
 
 
 router = APIRouter(prefix="/llm", tags=["LLM"])
@@ -55,27 +55,3 @@ def stream_chat(req: ChatRequest):
         )
 
 
-@router.post("/json_chat", response_model=dict)
-def json_chat(
-    message: str = Form(...),
-    system_prompt: str | None = Form(default=None),
-    use_rag: bool = Form(default=False),
-    file: UploadFile | None = File(default=None),
-):
-    try:
-        result = llm_client.json_chat(
-            user_message=message,
-            system_prompt=system_prompt,
-            file=file,
-            use_rag=use_rag,
-        )
-        return result
-
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"LLM JSON request failed: {str(e)}"
-        )

@@ -55,8 +55,15 @@ TOOL_SELECTOR_PROMPT = (
     "Match by semantic meaning, not exact wording. For example, '现在几点?' means "
     "the same thing as '获取当前时间' and should call get_current_time. If the user "
     "asks for time in another country, city, or region, pass that place in "
-    "arguments.location. Return one valid JSON object only with this shape: "
-    '{"tool_calls":[{"name":"tool_name","arguments":{"location":"place"}}]}. '
+    "arguments.location. If the user asks to calculate, solve, evaluate, or asks "
+    "a basic arithmetic expression, call calculate_expression and pass only the "
+    "math expression in arguments.expression, for example '(24+1)*4'. If the user "
+    "asks about weather, today's weather, current weather, temperature, sunrise, "
+    "or sunset, call get_today_weather. Pass arguments.location only when the "
+    "user names a specific city, country, or region; otherwise omit it so the "
+    "tool defaults to Shenyang. Return one "
+    "valid JSON object only with this shape: "
+    '{"tool_calls":[{"name":"tool_name","arguments":{"expression":"(24+1)*4"}}]}. '
     'If no tool is needed, return {"tool_calls":[]}.'
 )
 

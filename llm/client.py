@@ -70,7 +70,7 @@ class LLMClient:
             if content:
                 yield content
 
-    def json_chat(
+    def Agent_Ask(
         self,
         user_message: str,
         system_prompt: str | None = None,

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
 class RagChunk(BaseModel):
@@ -14,13 +14,6 @@ class RagUploadResponse(BaseModel):
     chunks: list[RagChunk]
 
 
-class RagAskRequest(BaseModel):
-    question: str = Field(..., description="Question to answer from uploaded documents")
-    document_id: str = Field(..., description="Uploaded document id to retrieve from")
-    top_k: int | None = Field(default=None, ge=1, le=20)
-    rerank_top_k: int | None = Field(default=None, ge=1, le=10)
-
-
 class RagSource(BaseModel):
     chunk_id: str
     document_id: str
@@ -28,8 +21,3 @@ class RagSource(BaseModel):
     chunk_index: int
     content: str
 
-
-class RagAskResponse(BaseModel):
-    answer: str
-    sources: list[RagSource]
-    retrieval_mode: str = "chroma"

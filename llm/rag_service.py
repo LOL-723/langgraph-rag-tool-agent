@@ -11,10 +11,26 @@ from fastapi import UploadFile
 
 from core.config import settings
 from core.runtime import EXPECTED_PYTHON
-from schemas.rag import RagAskResponse, RagChunk, RagSource, RagUploadResponse
+from schemas.rag import RagChunk, RagSource, RagUploadResponse
 
 
 SUPPORTED_RAG_SUFFIXES = {".txt", ".md", ".csv", ".json", ".pdf", ".docx"}
+MAX_RETRIEVAL_SUB_QUERIES = 3
+RECURSIVE_CHUNK_SEPARATORS = ("\n\n", "\n", "。", ".", "！", "!", "？", "?")
+
+RETRIEVAL_PLAN_PROMPT = (
+    "You are a retrieval query planner for a vector database. "
+    "Review the user's question before embedding. Rewrite the main question for semantic retrieval, "
+    "including useful synonyms, implicit meaning, and document-style terms. "
+    "Do not split by default. Only create sub_queries when the question contains multiple independent "
+    "retrieval intents that need different evidence from the document. "
+    "For one clear question, return an empty sub_queries array. "
+    "Do not create sub_queries just for keyword expansion, synonyms, wording cleanup, or implicit meaning; "
+    "put those changes into rewritten_query. Do not answer the question. "
+    "Return one valid JSON object only with this shape: "
+    '{"rewritten_query":"...","sub_queries":["..."]}. '
+    f"sub_queries must contain at most {MAX_RETRIEVAL_SUB_QUERIES} items."
+)
 
 
 class RagError(ValueError):
@@ -27,6 +43,7 @@ class RagService:
         self.max_upload_bytes = settings.RAG_MAX_UPLOAD_MB * 1024 * 1024
         self.chunk_size = settings.RAG_CHUNK_SIZE
         self.chunk_overlap = min(settings.RAG_CHUNK_OVERLAP, max(0, self.chunk_size - 1))
+        self.min_chunk_size = min(settings.RAG_MIN_CHUNK_SIZE, self.chunk_size)
         self._lock = threading.Lock()
         self._embedding_model = None
         self._rerank_model = None
@@ -87,12 +104,27 @@ class RagService:
             except Exception:
                 pass
 
-            collection.upsert(
-                ids=chunk_ids,
-                embeddings=embeddings,
-                metadatas=metadatas,
-                documents=chunk_texts,
-            )
+            try:
+                collection.upsert(
+                    ids=chunk_ids,
+                    embeddings=embeddings,
+                    metadatas=metadatas,
+                    documents=chunk_texts,
+                )
+            except Exception as exc:
+                if not self._is_embedding_dimension_error(exc):
+                    raise
+                logging.warning(
+                    "Chroma collection embedding dimension mismatch; recreating collection: %s",
+                    exc,
+                )
+                collection = self._reset_collection()
+                collection.upsert(
+                    ids=chunk_ids,
+                    embeddings=embeddings,
+                    metadatas=metadatas,
+                    documents=chunk_texts,
+                )
 
         return RagUploadResponse(
             document_id=document_id,
@@ -101,147 +133,138 @@ class RagService:
             chunks=chunks,
         )
 
-    def ask(
-        self,
-        question: str,
-        top_k: int | None = None,
-        rerank_top_k: int | None = None,
-        document_id: str | None = None,
-    ) -> RagAskResponse:
-        if not question or not question.strip():
-            raise RagError("question cannot be empty")
-        if document_id is not None:
-            document_id = document_id.strip()
-            if not document_id:
-                raise RagError("document_id cannot be empty")
-            if not (self.storage_dir / document_id / "chunks.json").exists():
-                raise RagError(f"document not found: {document_id}")
 
-        retrieved, retrieval_mode = self.retrieve_with_mode(
-            question,
-            top_k or settings.RAG_RETRIEVE_TOP_K,
-            document_id=document_id,
-        )
-        if not retrieved:
-            return RagAskResponse(
-                answer="根据已上传文档无法回答。",
-                sources=[],
-                retrieval_mode=retrieval_mode,
-            )
-
-        reranked = self.rerank(question, retrieved, rerank_top_k or settings.RAG_RERANK_TOP_K)
-        answer = self.generate(question, [source.content for source in reranked])
-        return RagAskResponse(answer=answer, sources=reranked, retrieval_mode=retrieval_mode)
-
-    #rag_node召回入口，返回值为从向量数据库中召回的片段
+    # rag_node 的召回入口，返回从向量数据库或本地 chunks 中召回的片段。
     def retrieve_with_mode(
         self,
         query: str,
         top_k: int,
         document_id: str | None = None,
-    ) -> tuple[list[RagSource], str]:
-        query_embedding = self.embed_text(query)#选择使用的RAG方式(本地/Chroma)，并将问题转换为向量
+    ) -> tuple[list[RagSource], str, dict[str, object]]:
+        # 召回前先生成检索计划：rewritten_query 负责改写原问题，
+        # sub_queries 只承载真正独立的多角度检索意图。
+        retrieval_plan = self.build_retrieval_plan(query)
+        retrieval_queries = self._normalize_retrieval_queries(retrieval_plan, query)
+
+        # Chroma 支持一次查询多个问题向量，所以这里把多个检索 query
+        # 从 [query1, query2] 转成 [[向量1], [向量2]] 后统一提交。
+        query_embeddings = self.embed_chunks(retrieval_queries)
         collection = self._collection_or_none()
         if collection is None:
-            # Fallback retrieval: when Chroma is unavailable in the running
-            # environment, search saved chunks.json files directly.
-            return self._retrieve_from_local_chunks(
-                query_embedding,
+            # Chroma 不可用时走本地 chunks.json 召回，保证缺少向量库依赖时 RAG 仍能工作。
+            return self._retrieve_from_local_chunks_multi(
+                query_embeddings,
                 top_k,
                 document_id=document_id,
-            ), "local"
+            ), "local", retrieval_plan
 
-        #query_embedding自身就是问题的向量，但由于chroma支持一次性多问题，返回的需要是一个向量列表，因此用query_embeddings，从[X]变成[ [X] ]
-        query_kwargs: dict[str, object] = {
-            "query_embeddings": [query_embedding],
-            "n_results": top_k,
-        }
-        if document_id:
-            query_kwargs["where"] = {"document_id": document_id}
-        results = collection.query(**query_kwargs)
-        #由于问题有可能为多个，所以documents，metadatas，ids也都是列表，但"问题向量"只有一个，所以拿[0]
-        #results.get("documents") or [[]]代表能拿到"documents"就拿。拿不到就用[[]]这个空列表代替，避免执行报错
-        documents = (results.get("documents") or [[]])[0]
-        metadatas = (results.get("metadatas") or [[]])[0]
-        ids = (results.get("ids") or [[]])[0]
-
-        sources = []
-        #匹对列表，每次都拿id[X]，documents[X]，metadatas[X]
-        for chunk_id, content, metadata in zip(ids, documents, metadatas):
-            metadata = metadata or {}
-            sources.append(
-                RagSource(
-                    chunk_id=chunk_id,
-                    document_id=str(metadata.get("document_id", "")),
-                    filename=str(metadata.get("filename", "")),
-                    chunk_index=int(metadata.get("chunk_index", 0)),
-                    content=content,
+        try:
+            if document_id:
+                results = collection.query(
+                    query_embeddings=query_embeddings,
+                    n_results=top_k,
+                    where={"document_id": document_id},
                 )
-            )
-        return sources, "chroma"
+            else:
+                results = collection.query(
+                    query_embeddings=query_embeddings,
+                    n_results=top_k,
+                )
+        except Exception as exc:
+            if self._is_embedding_dimension_error(exc):
+                logging.warning(
+                    "Chroma collection embedding dimension mismatch; using local chunk retrieval: %s",
+                    exc,
+                )
+                # collection 维度和新 embedding 维度不一致时，退回本地多向量召回。
+                return self._retrieve_from_local_chunks_multi(
+                    query_embeddings,
+                    top_k,
+                    document_id=document_id,
+                ), "local", retrieval_plan
+            raise
+        # results 中 documents、metadatas、ids 都按 query_embeddings 分组；
+        # 需要展开所有问题向量的召回结果，再合并同一个 chunk。
+        sources = self._sources_from_chroma_results(results)
+        return self._dedupe_sources(sources), "chroma", retrieval_plan
 
-    def retrieve(self, query: str, top_k: int, document_id: str | None = None) -> list[RagSource]:
-        sources, _ = self.retrieve_with_mode(query, top_k, document_id=document_id)
-        return sources
 
-    #rag_node重排入口，返回重排后的相关性最高的top_k个片段
+    # rag_node 的重排入口，返回相关性最高的 top_k 个片段。
     def rerank(self, query: str, sources: list[RagSource], top_k: int) -> list[RagSource]:
         if not sources:
             return []
         if self.rerank_model is None:
             return sources[:top_k]
         
-        #每个召回片段和问题组键值对
+        # 每个召回片段和问题组成一个待打分 pair。
         pairs = [(query, source.content) for source in sources]
-        #然后用Transformer模型进行预测键值对相关性数值
+        # 使用 CrossEncoder 对 pair 的相关性打分。
         scores = self.rerank_model.predict(pairs)
-        #将数值排序，最后只返回相关性最高的top_k个片段
-        #zip(sources, scores)将两个列表配对成元组，例：sources=["A","B","C"]，scores=[0.9,0.8,0.7]，组合后[[A,0.9][B,0.8]]
-        #key=lambda item: float(item[1])，按每个元组的第二个元素（分数）排序
+        # 按分数倒序排序，保留相关性最高的 top_k 个片段。
+        # zip(sources, scores) 将片段和分数组合成元组，例如 (source, 0.9)。
+        # key=lambda item: float(item[1]) 表示按元组中的分数排序。
         ranked = sorted(zip(sources, scores), key=lambda item: float(item[1]), reverse=True)
         return [source for source, _ in ranked[:top_k]]
 
-    def generate(self, question: str, chunks: list[str]) -> str:
-        from llm.client import llm_client
 
-        context = "\n\n".join(f"[{index}] {chunk}" for index, chunk in enumerate(chunks))
-        system_prompt = (
-            "你是一个知识库问答助手。只能根据提供的文档片段回答。"
-            "如果片段中没有答案，直接说：根据已上传文档无法回答。"
-        )
-        user_message = f"""用户问题:
-{question}
+    # 在用户问题向量化前生成检索计划，返回 {"rewritten_query": str, "sub_queries": list[str]}。
+    # rewritten_query 是改写后的主检索问题；sub_queries 是独立多角度检索问题，失败时回退原问题。
+    def build_retrieval_plan(self, query: str) -> dict[str, object]:
+        fallback = {"rewritten_query": query, "sub_queries": []}
+        if not query or not query.strip():
+            return fallback
 
-相关片段:
-{context}
+        try:
+            from openai import OpenAI
 
-请基于相关片段作答，不要编造信息。"""
-        return llm_client.chat(user_message=user_message, system_prompt=system_prompt)
+            client = OpenAI(
+                api_key=settings.DEEPSEEK_API_KEY,
+                base_url=settings.DEEPSEEK_BASE_URL,
+                timeout=settings.LLM_TIMEOUT,
+            )
+            response = client.chat.completions.create(
+                model=settings.LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": RETRIEVAL_PLAN_PROMPT},
+                    {"role": "user", "content": query},
+                ],
+                temperature=settings.LLM_TEMPERATURE,
+                response_format={"type": "json_object"},
+            )
+            content = response.choices[0].message.content or "{}"
+            data = json.loads(content)
+        except Exception as exc:
+            logging.warning("Failed to build RAG retrieval plan; using original query: %s", exc)
+            return fallback
+
+        if not isinstance(data, dict):
+            return fallback
+
+        rewritten_query = data.get("rewritten_query")
+        sub_queries = data.get("sub_queries")
+        if not isinstance(rewritten_query, str) or not rewritten_query.strip():
+            rewritten_query = query
+        if not isinstance(sub_queries, list):
+            sub_queries = []
+
+        # 只保留非空字符串，并限制子问题数量，避免一次 RAG 召回产生过多候选片段。
+        return {
+            "rewritten_query": rewritten_query,
+            "sub_queries": [
+                item
+                for item in sub_queries
+                if isinstance(item, str) and item.strip()
+            ][:MAX_RETRIEVAL_SUB_QUERIES],
+        }
 
     def split_into_chunks(self, text: str) -> list[str]:
         normalized = re.sub(r"\r\n?", "\n", text).strip()
         normalized = re.sub(r"\n{3,}", "\n\n", normalized)
-        chunks = []
-        start = 0
-        while start < len(normalized):
-            hard_end = min(start + self.chunk_size, len(normalized))
-            end = self._find_chunk_end(normalized, start, hard_end)
-            chunk = normalized[start:end].strip()
-            if chunk:
-                chunks.append(chunk)
-            if end >= len(normalized):
-                break
-            start = max(end - self.chunk_overlap, start + 1)
-        return chunks
+        chunks = self._recursive_split(normalized, 0)
+        return self._add_chunk_overlap([chunk for chunk in chunks if chunk.strip()])
 
-    #能使用Chroma就使用Chroma
-    #embedding_model是property，这时的embedding拿到的结果还是NumPy 数组(非原生列表)，return加上tolist()才变成向量[]，原生列表
-    def embed_text(self, text: str) -> list[float]:
-        if self.embedding_model is None:
-            return self._hash_embedding(text)
-        embedding = self.embedding_model.encode(text, normalize_embeddings=True)
-        return embedding.tolist()
-
+    # 能使用 Chroma 就使用 Chroma；embedding_model 不可用时退回本地 hash embedding。
+    # SentenceTransformer 返回 NumPy 数组，这里用 tolist() 转成原生 list。
     def embed_chunks(self, chunks: list[str]) -> list[list[float]]:
         if self.embedding_model is None:
             return [self._hash_embedding(chunk) for chunk in chunks]
@@ -266,7 +289,10 @@ class RagService:
                     try:
                         from sentence_transformers import SentenceTransformer
 
-                        self._embedding_model = SentenceTransformer(settings.RAG_EMBEDDING_MODEL)
+                        self._embedding_model = SentenceTransformer(
+                            settings.RAG_EMBEDDING_MODEL,
+                            token=settings.HF_TOKEN,
+                        )
                     except Exception as exc:
                         logging.warning(
                             "Failed to load embedding model %s; using local hash embeddings: %s",
@@ -286,7 +312,10 @@ class RagService:
                     try:
                         from sentence_transformers import CrossEncoder
 
-                        self._rerank_model = CrossEncoder(settings.RAG_RERANK_MODEL)
+                        self._rerank_model = CrossEncoder(
+                            settings.RAG_RERANK_MODEL,
+                            token=settings.HF_TOKEN,
+                        )
                     except Exception as exc:
                         logging.warning(
                             "Failed to load rerank model %s; skipping rerank: %s",
@@ -319,12 +348,141 @@ class RagService:
                     self._collection = client.get_or_create_collection(name=settings.RAG_COLLECTION_NAME)
         return self._collection
 
+    def _reset_collection(self):
+        import chromadb
+
+        client = chromadb.PersistentClient(path=settings.RAG_CHROMA_DIR)
+        try:
+            client.delete_collection(name=settings.RAG_COLLECTION_NAME)
+        except Exception:
+            pass
+        self._collection = client.get_or_create_collection(name=settings.RAG_COLLECTION_NAME)
+        return self._collection
+
+    @staticmethod
+    def _is_embedding_dimension_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "embedding" in message and "dimension" in message
+
     def _collection_or_none(self):
         try:
             return self.collection
         except RagError as exc:
             logging.warning("Chroma unavailable; using local chunk retrieval: %s", exc)
             return None
+
+    @staticmethod
+    def _normalize_retrieval_queries(
+        retrieval_plan: dict[str, object],
+        original_query: str,
+    ) -> list[str]:
+        # 将检索计划整理成最终传给 embed_chunks 的 list[str]。
+        # 这里只负责取 rewritten_query、追加 sub_queries、过滤空值并去重。
+        # 如果 rewritten_query 无效，就回退 original_query，保证至少有一个主检索 query。
+        raw_queries: list[str] = []
+        rewritten_query = retrieval_plan.get("rewritten_query")
+        sub_queries = retrieval_plan.get("sub_queries")
+
+        if isinstance(rewritten_query, str) and rewritten_query.strip():
+            raw_queries.append(rewritten_query)
+        else:
+            raw_queries.append(original_query)
+
+        if isinstance(sub_queries, list):
+            raw_queries.extend(
+                item
+                for item in sub_queries
+                if isinstance(item, str) and item.strip()
+            )
+
+        queries: list[str] = []
+        seen: set[str] = set()
+        for query in raw_queries:
+            normalized = query.strip()
+            key = normalized.casefold()
+            if not normalized or key in seen:
+                continue
+            seen.add(key)
+            queries.append(normalized)
+        return queries or [original_query]
+
+    # Chroma 多 query 查询返回二维结果：外层按问题向量分组，内层是该问题的 top_k 片段。
+    def _sources_from_chroma_results(self, results: dict[str, object]) -> list[RagSource]:
+        documents_groups = results.get("documents") or []
+        metadatas_groups = results.get("metadatas") or []
+        ids_groups = results.get("ids") or []
+
+        if not isinstance(documents_groups, list):
+            return []
+
+        sources: list[RagSource] = []
+        for query_index, documents in enumerate(documents_groups):
+            # metadatas 和 ids 与 documents 使用相同的分组下标，三者按位置配对。
+            metadatas = self._group_at(metadatas_groups, query_index)
+            ids = self._group_at(ids_groups, query_index)
+            if not isinstance(documents, list):
+                continue
+
+            for result_index, content in enumerate(documents):
+                metadata = self._item_at(metadatas, result_index) or {}
+                chunk_id = self._item_at(ids, result_index)
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                sources.append(
+                    RagSource(
+                        chunk_id=str(chunk_id or ""),
+                        document_id=str(metadata.get("document_id", "")),
+                        filename=str(metadata.get("filename", "")),
+                        chunk_index=int(metadata.get("chunk_index", 0)),
+                        content=str(content or ""),
+                    )
+                )
+        return sources
+
+    @staticmethod
+    def _group_at(groups: object, index: int) -> object:
+        if isinstance(groups, list) and index < len(groups):
+            return groups[index]
+        return []
+
+    @staticmethod
+    def _item_at(items: object, index: int) -> object:
+        if isinstance(items, list) and index < len(items):
+            return items[index]
+        return None
+
+    @staticmethod
+    def _dedupe_sources(sources: list[RagSource]) -> list[RagSource]:
+        deduped: list[RagSource] = []
+        seen: set[str] = set()
+        for source in sources:
+            # 多个检索角度可能召回同一个 chunk，优先用 Chroma id 去重。
+            key = source.chunk_id.strip()
+            if not key:
+                key = f"{source.document_id}:{source.chunk_index}"
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(source)
+        return deduped
+
+    def _retrieve_from_local_chunks_multi(
+        self,
+        query_embeddings: list[list[float]],
+        top_k: int,
+        document_id: str | None = None,
+    ) -> list[RagSource]:
+        sources: list[RagSource] = []
+        for query_embedding in query_embeddings:
+            # 本地 fallback 仍按单向量计算余弦相似度，再把多角度结果合并去重。
+            sources.extend(
+                self._retrieve_from_local_chunks(
+                    query_embedding,
+                    top_k,
+                    document_id=document_id,
+                )
+            )
+        return self._dedupe_sources(sources)
 
     def _retrieve_from_local_chunks(
         self,
@@ -351,12 +509,20 @@ class RagService:
             )
             filename = source_file.name if source_file else current_document_id
 
+            valid_chunks: list[tuple[dict[str, object], str]] = []
             for chunk_data in chunks_data:
+                if not isinstance(chunk_data, dict):
+                    continue
                 content = str(chunk_data.get("content", ""))
                 if not content:
                     continue
+                valid_chunks.append((chunk_data, content))
 
-                chunk_embedding = self.embed_text(content)
+            if not valid_chunks:
+                continue
+
+            chunk_embeddings = self.embed_chunks([content for _, content in valid_chunks])
+            for (chunk_data, content), chunk_embedding in zip(valid_chunks, chunk_embeddings):
                 score = self._cosine_similarity(query_embedding, chunk_embedding)
                 source = RagSource(
                     chunk_id=str(chunk_data.get("id", "")),
@@ -370,15 +536,92 @@ class RagService:
         scored_sources.sort(key=lambda item: item[0], reverse=True)
         return [source for _, source in scored_sources[:top_k]]
 
-    def _find_chunk_end(self, text: str, start: int, hard_end: int) -> int:
-        if hard_end >= len(text):
-            return len(text)
-        window = text[start:hard_end]
-        for delimiter in ("\n\n", "\n", "。", "！", "？", ".", "!", "?"):
-            pos = window.rfind(delimiter)
-            if pos >= self.chunk_size * 0.5:
-                return start + pos + len(delimiter)
-        return hard_end
+    def _recursive_split(self, text: str, separator_index: int) -> list[str]:
+        text = text.strip()
+        if not text:
+            return []
+        if separator_index >= len(RECURSIVE_CHUNK_SEPARATORS):
+            if len(text) <= self.chunk_size:
+                return [text]
+            return self._fixed_length_split(text)
+
+        separator = RECURSIVE_CHUNK_SEPARATORS[separator_index]
+        parts = self._split_with_separator(text, separator)
+        if len(parts) == 1:
+            if len(text) <= self.chunk_size:
+                return [text]
+            return self._recursive_split(text, separator_index + 1)
+
+        chunks: list[str] = []
+        for part in parts:
+            if len(part) > self.chunk_size:
+                chunks.extend(self._recursive_split(part, separator_index + 1))
+                continue
+            chunks.append(part)
+        return self._merge_small_chunks(chunks)
+
+    @staticmethod
+    def _split_with_separator(text: str, separator: str) -> list[str]:
+        pieces = text.split(separator)
+        parts: list[str] = []
+        for index, piece in enumerate(pieces):
+            if not piece.strip():
+                continue
+            part = piece
+            if index < len(pieces) - 1:
+                part = f"{part}{separator}"
+            if part.strip():
+                parts.append(part)
+        return parts
+
+    def _merge_small_chunks(self, parts: list[str]) -> list[str]:
+        chunks: list[str] = []
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            if len(part) > self.chunk_size:
+                chunks.extend(self._fixed_length_split(part))
+                continue
+
+            if not chunks:
+                chunks.append(part)
+                continue
+
+            previous = chunks[-1]
+            candidate = f"{previous}{part}"
+            if len(previous) < self.min_chunk_size and len(candidate) <= self.chunk_size:
+                chunks[-1] = candidate
+            else:
+                chunks.append(part)
+
+        if len(chunks) > 1 and len(chunks[-1]) < self.min_chunk_size:
+            candidate = f"{chunks[-2]}{chunks[-1]}"
+            if len(candidate) <= self.chunk_size:
+                chunks[-2] = candidate
+                chunks.pop()
+        return chunks
+
+    def _fixed_length_split(self, text: str) -> list[str]:
+        return [
+            text[start:start + self.chunk_size].strip()
+            for start in range(0, len(text), self.chunk_size)
+            if text[start:start + self.chunk_size].strip()
+        ]
+
+    def _add_chunk_overlap(self, chunks: list[str]) -> list[str]:
+        if self.chunk_overlap <= 0:
+            return chunks
+
+        overlapped: list[str] = []
+        for index, chunk in enumerate(chunks):
+            room = self.chunk_size - len(chunk)
+            if index > 0 and room > 0:
+                previous = chunks[index - 1]
+                overlap = previous[-min(self.chunk_overlap, room):]
+                chunk = f"{overlap}{chunk}"
+            overlapped.append(chunk)
+        return overlapped
 
     @staticmethod
     def _read_text(file_path: Path) -> str:

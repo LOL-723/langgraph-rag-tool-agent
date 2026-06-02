@@ -29,6 +29,7 @@ class AgentState(TypedDict, total=False):
     tool_results: list[dict[str, Any]]
     retrieved_docs: list[dict[str, Any]]
     rag_retrieval_mode: str
+    rag_query_str: dict[str, Any]
     logs: list[dict[str, Any]]
     retry_count: int
     verification_count: int
@@ -133,7 +134,7 @@ def rag_node(state: AgentState) -> AgentState:
     question = state["question"]
     file_info = state.get("file_info") or {}
     document_id = str(file_info.get("document_id", "")).strip() or None
-    retrieved, retrieval_mode = rag_service.retrieve_with_mode(
+    retrieved, retrieval_mode, rag_query_str = rag_service.retrieve_with_mode(
         question,
         settings.RAG_RETRIEVE_TOP_K,
         document_id=document_id,
@@ -149,6 +150,7 @@ def rag_node(state: AgentState) -> AgentState:
     return {
         "retrieved_docs": sources,
         "rag_retrieval_mode": retrieval_mode,
+        "rag_query_str": rag_query_str,
         "logs": add_log(
             state=state,
             node="rag_node",
@@ -156,6 +158,7 @@ def rag_node(state: AgentState) -> AgentState:
             extra={
                 "source_count": len(sources),
                 "retrieval_mode": retrieval_mode,
+                "rag_query_str": rag_query_str,
                 "document_id": document_id,
                 "filename": file_info.get("filename"),
             },
@@ -368,6 +371,7 @@ def _verify_answer(state: AgentState) -> dict[str, Any]:
             {"role": "system", "content": VERIFIER_PROMPT},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ],
+        temperature=settings.LLM_TEMPERATURE,
         response_format={"type": "json_object"},
     )
 
@@ -411,6 +415,7 @@ def _verification_context(state: AgentState) -> dict[str, Any]:
     if route == "rag":
         context["retrieved_docs"] = state.get("retrieved_docs", [])
         context["rag_retrieval_mode"] = state.get("rag_retrieval_mode")
+        context["rag_query_str"] = state.get("rag_query_str")
     elif route == "tool":
         context["tool_calls"] = state.get("tool_calls", [])
         context["tool_results"] = state.get("tool_results", [])
@@ -495,6 +500,7 @@ def _should_route_to_tool(user_message: str) -> bool:
             },
             {"role": "user", "content": user_message},
         ],
+        temperature=settings.LLM_TEMPERATURE,
         response_format={"type": "json_object"},
     )
 
@@ -539,6 +545,7 @@ def _select_tool_calls(user_message: str) -> list[dict[str, Any]]:
             },
             {"role": "user", "content": user_message},
         ],
+        temperature=settings.LLM_TEMPERATURE,
         response_format={"type": "json_object"},
     )
 
@@ -567,6 +574,7 @@ def _chat_completion(user_message: str, system_prompt: str | None = None) -> str
     response = _openai_client().chat.completions.create(
         model=settings.LLM_MODEL,
         messages=messages,
+        temperature=settings.LLM_TEMPERATURE,
     )
     return response.choices[0].message.content or ""
 

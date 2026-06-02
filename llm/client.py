@@ -4,7 +4,7 @@ from typing import Any
 from openai import OpenAI
 
 from core.config import settings
-from llm import langgraph_def
+from llm import langgraph
 
 
 class LLMClient:
@@ -14,9 +14,11 @@ class LLMClient:
         base_url: str,
         model: str,
         timeout: float = 30.0,
+        temperature: float = 0.1,
     ):
         self.model = model
-        self.langgraph = langgraph_def.build_graph()
+        self.temperature = temperature
+        self.langgraph = langgraph.build_graph()
 
         self.client = OpenAI(
             api_key=api_key,
@@ -40,6 +42,7 @@ class LLMClient:
         response = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
+            temperature=self.temperature,
         )
         return response.choices[0].message.content or ""
 
@@ -59,6 +62,7 @@ class LLMClient:
         stream = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
+            temperature=self.temperature,
             stream=True,
         )
 
@@ -97,8 +101,8 @@ class LLMClient:
         system_prompt: str | None = None,
         file_info: dict[str, Any] | None = None,
         use_rag: bool = False,
-    ) -> langgraph_def.AgentState:
-        initial_state: langgraph_def.AgentState = {
+    ) -> langgraph.AgentState:
+        initial_state: langgraph.AgentState = {
             "question": user_message,
             "system_prompt": system_prompt,
             "use_rag": use_rag,
@@ -118,7 +122,7 @@ class LLMClient:
 
     def _format_graph_json_result(
         self,
-        graph_result: langgraph_def.AgentState,
+        graph_result: langgraph.AgentState,
     ) -> dict[str, Any]:
         route = graph_result.get("route", "chat")
         answer = graph_result.get("answer", "")
@@ -158,7 +162,7 @@ class LLMClient:
         return result
 
     @staticmethod
-    def _rag_response_metadata(graph_result: langgraph_def.AgentState) -> dict[str, Any]:
+    def _rag_response_metadata(graph_result: langgraph.AgentState) -> dict[str, Any]:
         if graph_result.get("route") != "rag":
             return {}
 
@@ -171,6 +175,7 @@ class LLMClient:
             },
             "rag_sources": graph_result.get("retrieved_docs", []),
             "rag_retrieval_mode": graph_result.get("rag_retrieval_mode"),
+            "rag_query_str": graph_result.get("rag_query_str"),
         }
 
     def _upload_optional_file(self, file: Any | None) -> dict[str, Any] | None:
@@ -183,43 +188,10 @@ class LLMClient:
         upload_result = anyio.run(rag_service.upload, file)
         return upload_result.model_dump()
 
-    def _validate_json_semantics(self, data: dict[str, Any]) -> None:
-        for key, value in data.items():
-            self._validate_json_value(key, value)
-
-    def _validate_json_value(self, key: str, value: Any) -> None:
-        key_lower = key.lower()
-
-        if isinstance(value, dict):
-            self._validate_json_semantics(value)
-            return
-
-        if isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict):
-                    self._validate_json_semantics(item)
-            if self._key_contains(key_lower, ("skill", "tag", "item", "hobby")):
-                invalid_items = [item for item in value if not isinstance(item, str)]
-                if invalid_items:
-                    raise ValueError(f"{key} must contain strings only")
-            return
-
-        if self._key_contains(key_lower, ("name", "title", "email", "phone", "address", "date")):
-            if not isinstance(value, str):
-                raise ValueError(f"{key} must be a string")
-
-        if self._key_contains(key_lower, ("age", "count", "quantity", "score", "number")):
-            if not isinstance(value, int | float) or isinstance(value, bool):
-                raise ValueError(f"{key} must be a number")
-
-    @staticmethod
-    def _key_contains(key: str, words: tuple[str, ...]) -> bool:
-        return any(word in key for word in words)
-
-
 llm_client = LLMClient(
     api_key=settings.DEEPSEEK_API_KEY,
     base_url=settings.DEEPSEEK_BASE_URL,
     model=settings.LLM_MODEL,
     timeout=settings.LLM_TIMEOUT,
+    temperature=settings.LLM_TEMPERATURE,
 )

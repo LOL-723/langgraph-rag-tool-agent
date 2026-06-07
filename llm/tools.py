@@ -6,6 +6,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
+from llm.Agent.rag_tools import retrieve_uploaded_document_tool
+
 
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_WEATHER_LOCATION = "沈阳"
@@ -517,3 +519,14 @@ TOOL_ARGUMENTS["get_today_weather"] = {
     "timezone_name": "可选 IANA 时区名；支持范围和时间查询一致。",
 }
 TOOL_REGISTRY["get_today_weather"] = get_today_weather
+
+TOOL_DESCRIPTIONS["retrieve_uploaded_document"] = (
+    "Search uploaded documents or the local RAG knowledge base for relevant chunks. "
+    "Use this when the user asks a question that needs evidence from uploaded documents. "
+    "This tool returns retrieved context and metadata; it does not generate the final answer."
+)
+TOOL_ARGUMENTS["retrieve_uploaded_document"] = {
+    "query": "The retrieval question to search in uploaded documents or the RAG knowledge base.",
+    "document_id": "Optional uploaded document id. The runtime should inject this from file context when available.",
+}
+TOOL_REGISTRY["retrieve_uploaded_document"] = retrieve_uploaded_document_tool

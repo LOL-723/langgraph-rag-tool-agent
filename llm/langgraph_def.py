@@ -5,7 +5,7 @@ from langgraph.graph import END, START, StateGraph
 from openai import OpenAI
 
 from core.config import settings
-from llm.rag_service import rag_service
+from llm.Agent.rag_tools import retrieve_document_context
 from llm.tools import TOOL_ARGUMENTS, TOOL_DESCRIPTIONS, TOOL_REGISTRY
 
 
@@ -18,7 +18,7 @@ MAX_CHAT_RETRIES = 1
 MAX_ROUTER_RETRIES = 2
 
 
-class AgentState(TypedDict, total=False):
+class LangGraphState(TypedDict, total=False):
     question: str
     system_prompt: str | None
     answer: str
@@ -82,7 +82,7 @@ VERIFIER_PROMPT = (
 
 
 def add_log(
-    state: AgentState,
+    state: LangGraphState,
     node: str,
     message: str,
     extra: dict[str, Any] | None = None,
@@ -97,7 +97,7 @@ def add_log(
     return logs + [log_item]
 
 
-def router_node(state: AgentState) -> AgentState:
+def router_node(state: LangGraphState) -> LangGraphState:
     question = state["question"]
 
     if state.get("file_info") and state.get("use_rag", False):
@@ -120,7 +120,7 @@ def router_node(state: AgentState) -> AgentState:
 
 
 def route_decision(
-    state: AgentState,
+    state: LangGraphState,
 ) -> Literal["rag_node", "tool_selector_node", "answer_node"]:
     route = state["route"]
     if route == "rag":
@@ -130,35 +130,28 @@ def route_decision(
     return "answer_node"
 
 
-def rag_node(state: AgentState) -> AgentState:
+def rag_node(state: LangGraphState) -> LangGraphState:
     question = state["question"]
     file_info = state.get("file_info") or {}
     document_id = str(file_info.get("document_id", "")).strip() or None
-    retrieved, retrieval_mode, rag_query_str = rag_service.retrieve_with_mode(
-        question,
-        settings.RAG_RETRIEVE_TOP_K,
+    result = retrieve_document_context(
+        query=question,
         document_id=document_id,
     )
-    reranked = rag_service.rerank(
-        question,
-        retrieved,
-        settings.RAG_RERANK_TOP_K,
-    )
-    #model_dump() 的作用就是把 Pydantic 对象转成 Python 原生 dict
-    sources = [source.model_dump() for source in reranked]
+    sources = result["retrieved_docs"]
 
     return {
         "retrieved_docs": sources,
-        "rag_retrieval_mode": retrieval_mode,
-        "rag_query_str": rag_query_str,
+        "rag_retrieval_mode": result["rag_retrieval_mode"],
+        "rag_query_str": result["rag_query_str"],
         "logs": add_log(
             state=state,
             node="rag_node",
             message="retrieved and reranked uploaded documents",
             extra={
                 "source_count": len(sources),
-                "retrieval_mode": retrieval_mode,
-                "rag_query_str": rag_query_str,
+                "retrieval_mode": result["rag_retrieval_mode"],
+                "rag_query_str": result["rag_query_str"],
                 "document_id": document_id,
                 "filename": file_info.get("filename"),
             },
@@ -166,7 +159,7 @@ def rag_node(state: AgentState) -> AgentState:
     }
 
 
-def tool_selector_node(state: AgentState) -> AgentState:
+def tool_selector_node(state: LangGraphState) -> LangGraphState:
     question = state["question"]
     tool_calls = _select_tool_calls(question)
 
@@ -181,7 +174,7 @@ def tool_selector_node(state: AgentState) -> AgentState:
     }
 
 
-def tool_executor_node(state: AgentState) -> AgentState:
+def tool_executor_node(state: LangGraphState) -> LangGraphState:
     tool_results: list[dict[str, Any]] = []
 
     for tool_call in state.get("tool_calls", []):
@@ -212,7 +205,7 @@ def tool_executor_node(state: AgentState) -> AgentState:
     }
 
 
-def answer_node(state: AgentState) -> AgentState:
+def answer_node(state: LangGraphState) -> LangGraphState:
     answer = _chat_completion(
         user_message=_answer_user_message(state),
         system_prompt=_answer_system_prompt(state),
@@ -228,13 +221,13 @@ def answer_node(state: AgentState) -> AgentState:
     }
 
 
-def verifier_node(state: AgentState) -> AgentState:
+def verifier_node(state: LangGraphState) -> LangGraphState:
     verification = _verify_answer(state)
     has_hallucination = verification.get("has_hallucination", True)
     verification_count = int(state.get("verification_count", 0)) + 1
     reason = str(verification.get("reason", ""))
 
-    update: AgentState = {
+    update: LangGraphState = {
         "verification_count": verification_count,
         "has_hallucination": has_hallucination,
         "verifier_reason": reason,
@@ -279,7 +272,7 @@ def verifier_node(state: AgentState) -> AgentState:
 
 
 def build_graph():
-    graph_builder = StateGraph(AgentState)
+    graph_builder = StateGraph(LangGraphState)
 
     graph_builder.add_node("router_node", router_node)
     graph_builder.add_node("rag_node", rag_node)
@@ -317,11 +310,11 @@ def build_graph():
     return graph_builder.compile()
 
 
-def verifier_decision(state: AgentState) -> VerifierNext:
+def verifier_decision(state: LangGraphState) -> VerifierNext:
     return state.get("verifier_next", "end")
 
 
-def _next_verifier_step(state: AgentState) -> tuple[VerifierNext, AgentState]:
+def _next_verifier_step(state: LangGraphState) -> tuple[VerifierNext, LangGraphState]:
     answer_retry_count = int(state.get("answer_retry_count", 0))
     rag_retry_count = int(state.get("rag_retry_count", 0))
     tool_retry_count = int(state.get("tool_retry_count", 0))
@@ -350,7 +343,7 @@ def _next_verifier_step(state: AgentState) -> tuple[VerifierNext, AgentState]:
     return "end", {}
 
 
-def _verify_answer(state: AgentState) -> dict[str, Any]:
+def _verify_answer(state: LangGraphState) -> dict[str, Any]:
     answer = state.get("answer", "")
     if not answer or not answer.strip():
         return {
@@ -408,7 +401,7 @@ def _json_bool(value: Any, default: bool) -> bool:
     return default
 
 
-def _verification_context(state: AgentState) -> dict[str, Any]:
+def _verification_context(state: LangGraphState) -> dict[str, Any]:
     route = state.get("route", "chat")
     context: dict[str, Any] = {}
 
@@ -425,13 +418,13 @@ def _verification_context(state: AgentState) -> dict[str, Any]:
     return context
 
 
-def _merge_state(state: AgentState, update: AgentState) -> AgentState:
+def _merge_state(state: LangGraphState, update: LangGraphState) -> LangGraphState:
     merged = dict(state)
     merged.update(update)
     return merged
 
 
-def _answer_system_prompt(state: AgentState) -> str | None:
+def _answer_system_prompt(state: LangGraphState) -> str | None:
     route = state.get("route", "chat")
     user_system_prompt = state.get("system_prompt")
 
@@ -455,7 +448,7 @@ def _answer_system_prompt(state: AgentState) -> str | None:
     return prompt
 
 
-def _answer_user_message(state: AgentState) -> str:
+def _answer_user_message(state: LangGraphState) -> str:
     question = state["question"]
     route = state.get("route", "chat")
 

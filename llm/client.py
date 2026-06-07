@@ -101,8 +101,8 @@ class LLMClient:
         system_prompt: str | None = None,
         file_info: dict[str, Any] | None = None,
         use_rag: bool = False,
-    ) -> langgraph.AgentState:
-        initial_state: langgraph.AgentState = {
+    ) -> langgraph.LangGraphState:
+        initial_state: langgraph.LangGraphState = {
             "question": user_message,
             "system_prompt": system_prompt,
             "use_rag": use_rag,
@@ -122,7 +122,7 @@ class LLMClient:
 
     def _format_graph_json_result(
         self,
-        graph_result: langgraph.AgentState,
+        graph_result: langgraph.LangGraphState,
     ) -> dict[str, Any]:
         route = graph_result.get("route", "chat")
         answer = graph_result.get("answer", "")
@@ -162,7 +162,7 @@ class LLMClient:
         return result
 
     @staticmethod
-    def _rag_response_metadata(graph_result: langgraph.AgentState) -> dict[str, Any]:
+    def _rag_response_metadata(graph_result: langgraph.LangGraphState) -> dict[str, Any]:
         if graph_result.get("route") != "rag":
             return {}
 

@@ -109,7 +109,6 @@ class LLMClient:
             "retry_count": 0,
             "verification_count": 0,
             "answer_retry_count": 0,
-            "rag_retry_count": 0,
             "tool_retry_count": 0,
             "chat_retry_count": 0,
             "router_retry_count": 0,
@@ -127,55 +126,24 @@ class LLMClient:
         route = graph_result.get("route", "chat")
         answer = graph_result.get("answer", "")
         end_status = graph_result.get("end_status")
-        use_local_retrieval = route == "rag" and graph_result.get("rag_retrieval_mode") == "local"
-        rag_metadata = self._rag_response_metadata(graph_result)
-
         try:
             parsed_answer = json.loads(answer)
         except json.JSONDecodeError:
-            message = f"{answer}(local retrieval)" if use_local_retrieval and answer else answer
-            result = {
+            return {
                 "route": route,
                 "end_status": end_status,
-                "message": message,
+                "message": answer,
             }
-            result.update(rag_metadata)
-            return result
 
         if isinstance(parsed_answer, dict):
-            if use_local_retrieval:
-                message = str(parsed_answer.get("message", ""))
-                parsed_answer["message"] = f"{message}(local retrieval)"
             parsed_answer["route"] = route
             parsed_answer["end_status"] = end_status
-            parsed_answer.update(rag_metadata)
             return parsed_answer
 
-        result = {
+        return {
             "route": route,
             "end_status": end_status,
             "data": parsed_answer,
-        }
-        if use_local_retrieval:
-            result["message"] = "(local retrieval)"
-        result.update(rag_metadata)
-        return result
-
-    @staticmethod
-    def _rag_response_metadata(graph_result: langgraph.LangGraphState) -> dict[str, Any]:
-        if graph_result.get("route") != "rag":
-            return {}
-
-        file_info = graph_result.get("file_info") or {}
-        return {
-            "rag_document": {
-                "document_id": file_info.get("document_id"),
-                "filename": file_info.get("filename"),
-                "chunk_count": file_info.get("chunk_count"),
-            },
-            "rag_sources": graph_result.get("retrieved_docs", []),
-            "rag_retrieval_mode": graph_result.get("rag_retrieval_mode"),
-            "rag_query_str": graph_result.get("rag_query_str"),
         }
 
     def _upload_optional_file(self, file: Any | None) -> dict[str, Any] | None:

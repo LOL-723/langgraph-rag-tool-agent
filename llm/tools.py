@@ -479,20 +479,16 @@ def _format_minute_time(value: Any) -> str | None:
         return value[:16]
 
 
-TOOL_DESCRIPTIONS: dict[str, str] = {
-    "get_current_time": "获取当前时间，返回包含年月日时分秒的完整时间戳。默认返回北京时间；如果用户询问其他国家、城市或地区时间，传入 location 或 IANA timezone_name。",
-}
+TOOL_DESCRIPTIONS: dict[str, str] = {}
+TOOL_ARGUMENTS: dict[str, dict[str, str]] = {}
+TOOL_REGISTRY: dict[str, Callable[..., Any]] = {}
 
-TOOL_ARGUMENTS: dict[str, dict[str, str]] = {
-    "get_current_time": {
-        "location": "用户询问的国家、城市或地区名称，例如：北京、日本、纽约、伦敦。默认可省略。",
-        "timezone_name": "可选 IANA 时区名，例如：Asia/Shanghai、Asia/Tokyo、America/New_York。",
-    },
+TOOL_DESCRIPTIONS["get_current_time"] = "获取当前时间，返回包含年月日时分秒的完整时间戳。默认返回北京时间；如果用户询问其他国家、城市或地区时间，传入 location 或 IANA timezone_name。"
+TOOL_ARGUMENTS["get_current_time"] = {
+    "location": "用户询问的国家、城市或地区名称，例如：北京、日本、纽约、伦敦。默认可省略。",
+    "timezone_name": "可选 IANA 时区名，例如：Asia/Shanghai、Asia/Tokyo、America/New_York。",
 }
-
-TOOL_REGISTRY: dict[str, Callable[..., Any]] = {
-    "get_current_time": get_current_time,
-}
+TOOL_REGISTRY["get_current_time"] = get_current_time
 
 TOOL_DESCRIPTIONS["calculate_expression"] = (
     "安全计算基础数学表达式，支持 +、-、*、/、//、%、** 和括号。"

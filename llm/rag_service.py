@@ -134,7 +134,7 @@ class RagService:
         )
 
 
-    # rag_node 的召回入口，返回从向量数据库或本地 chunks 中召回的片段。
+    # RAG tool recall entrypoint. Returns chunks from Chroma or local storage.
     def retrieve_with_mode(
         self,
         query: str,
@@ -189,7 +189,7 @@ class RagService:
         return self._dedupe_sources(sources), "chroma", retrieval_plan
 
 
-    # rag_node 的重排入口，返回相关性最高的 top_k 个片段。
+    # RAG tool rerank entrypoint. Returns the top_k most relevant chunks.
     def rerank(self, query: str, sources: list[RagSource], top_k: int) -> list[RagSource]:
         if not sources:
             return []
